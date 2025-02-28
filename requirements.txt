@@ -1,0 +1,15 @@
+flask
+flask-cors
+flask-limiter
+requests
+openai
+numpy
+pinecone-client==5.0.1
+python-docx
+Pillow
+pytesseract
+pymupdf
+PyPDF2
+gunicorn
+redis
+python-magic
