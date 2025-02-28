@@ -4,7 +4,8 @@ import requests
 import logging
 import textwrap
 import json
-import uuid  # For generating unique claimIDs
+import uuid
+import redis
 from flask import Flask, request, jsonify
 from docx import Document
 from PIL import Image, ImageEnhance
@@ -25,9 +26,14 @@ PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 XAI_API_KEY = os.environ.get("XAI_API_KEY")
 REDIS_URL = os.environ.get("REDIS_URL")
 
-if not all([OPENAI_API_KEY, PINECONE_API_KEY, XAI_API_KEY]):
+if not all([OPENAI_API_KEY, PINECONE_API_KEY, XAI_API_KEY, REDIS_URL]):
     logger.error("Missing required environment variables")
-    raise EnvironmentError("Set OPENAI_API_KEY, PINECONE_API_KEY, and XAI_API_KEY")
+    raise EnvironmentError("Set OPENAI_API_KEY, PINECONE_API_KEY, XAI_API_KEY, and REDIS_URL")
+
+# ==============================
+# REDIS SETUP
+# ==============================
+redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 # ==============================
 # FLASK SETUP
@@ -46,7 +52,7 @@ limiter = Limiter(
     get_remote_address,
     app=app,
     default_limits=["1000 per day", "100 per hour"],
-    storage_uri=REDIS_URL if REDIS_URL else "memory://"
+    storage_uri=REDIS_URL
 )
 
 # ==============================
@@ -85,16 +91,22 @@ class XAIChatClient:
             "stream": False
         }
         try:
+            logger.info(f"Sending xAI request with payload: {json.dumps(payload, indent=2)}")
             response = requests.post(
                 f"{self.base_url}/chat/completions",
                 headers=headers,
-                json=payload
+                json=payload,
+                timeout=30
             )
             response.raise_for_status()
+            logger.info(f"xAI response: {response.text}")
             return response.json()["choices"][0]["message"]["content"].strip()
         except requests.RequestException as e:
-            logger.error(f"xAI API error: {e}")
-            return "Sorry, I encountered an error. Please try again."
+            error_msg = f"xAI API error: {str(e)}"
+            if hasattr(e.response, 'text'):
+                error_msg += f" - Response: {e.response.text}"
+            logger.error(error_msg)
+            return f"Error: Could not process your request due to an issue with the AI service ({str(e)}). Please try again later."
 
 xai_chat_client = XAIChatClient(api_key=XAI_API_KEY)
 
@@ -113,11 +125,6 @@ def load_craftsmen():
 
 CRAFTSMEN = load_craftsmen()
 CRAFTSMEN_JSON = json.dumps(CRAFTSMEN)
-
-# ==============================
-# GLOBAL USER CONTEXT
-# ==============================
-user_context = {}  # Maps claimID to conversation and claim details
 
 # ==============================
 # HELPER FUNCTIONS
@@ -225,10 +232,8 @@ def start_conversation():
     if not user_id:
         return jsonify({"error": "userID required"}), 400
 
-    # Generate a unique claimID
     claim_id = str(uuid.uuid4())
     
-    # System prompt with updated priorities
     system_prompt = (
         "You are Dokie, an empathetic AI assisting users with insurance claims. "
         "Respond in the same language as the user's query. "
@@ -246,17 +251,26 @@ def start_conversation():
         "with a natural, empathetic, and context-aware conversation flow."
     )
 
-    user_context[claim_id] = {
+    # Store in Redis
+    redis_client.hset(f"claim:{claim_id}", mapping={
         "user_id": user_id,
-        "conversation": [{"role": "system", "content": system_prompt}],
-        "claim_details": {
-            "date": None,
-            "location": None,
-            "description": None,
-            "ephemeral_docs": []
-        }
-    }
+        "conversation": json.dumps([{"role": "system", "content": system_prompt}]),
+        "claim_details": json.dumps({"date": None, "location": None, "description": None, "ephemeral_docs": []})
+    })
+    redis_client.sadd(f"user:{user_id}:claims", claim_id)
+    
+    logger.info(f"Started new conversation with claimID: {claim_id} for userID: {user_id}")
     return jsonify({"message": "Conversation started.", "claimID": claim_id}), 200
+
+@app.route("/get_user_claims", methods=["POST"])
+def get_user_claims():
+    data = request.get_json()
+    user_id = data.get("userID")
+    if not user_id:
+        return jsonify({"error": "userID required"}), 400
+
+    claim_ids = redis_client.smembers(f"user:{user_id}:claims") or []
+    return jsonify({"claimIDs": list(claim_ids)}), 200
 
 @app.route("/upload_library", methods=["POST"])
 def upload_library():
@@ -265,20 +279,6 @@ def upload_library():
 
     file_obj = request.files["file"]
     user_id = request.form["userID"]
-
-    # Initialize minimal context if userID isn't tied to a claim yet
-    if not any(ctx["user_id"] == user_id for ctx in user_context.values()):
-        claim_id = str(uuid.uuid4())
-        user_context[claim_id] = {
-            "user_id": user_id,
-            "conversation": [],
-            "claim_details": {
-                "date": None,
-                "location": None,
-                "description": None,
-                "ephemeral_docs": []
-            }
-        }
 
     file_path = os.path.join(UPLOAD_FOLDER, file_obj.filename)
     file_obj.save(file_path)
@@ -303,14 +303,19 @@ def upload_library():
 
 @app.route("/upload_ephemeral", methods=["POST"])
 def upload_ephemeral():
-    if "file" not in request.files or "claimID" not in request.form:
-        return jsonify({"error": "file and claimID required"}), 400
+    if "file" not in request.files or "claimID" not in request.form or "userID" not in request.form:
+        return jsonify({"error": "file, claimID, and userID required"}), 400
 
     file_obj = request.files["file"]
     claim_id = request.form["claimID"]
+    user_id = request.form["userID"]
 
-    if claim_id not in user_context:
+    if not redis_client.exists(f"claim:{claim_id}"):
         return jsonify({"error": "Invalid claimID. Start a conversation first."}), 400
+    
+    stored_user_id = redis_client.hget(f"claim:{claim_id}", "user_id")
+    if stored_user_id != user_id:
+        return jsonify({"error": "Unauthorized: claimID does not belong to this user"}), 403
 
     ephemeral_path = os.path.join(EPHEMERAL_FOLDER, file_obj.filename)
     file_obj.save(ephemeral_path)
@@ -324,11 +329,13 @@ def upload_ephemeral():
     elif ext == ".pdf":
         extracted_text = extract_text_from_pdf(ephemeral_path)
 
-    user_context[claim_id]["claim_details"]["ephemeral_docs"].append({
+    claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
+    claim_details["ephemeral_docs"].append({
         "filename": file_obj.filename,
         "file_path": ephemeral_path,
         "extracted_text": extracted_text or ""
     })
+    redis_client.hset(f"claim:{claim_id}", "claim_details", json.dumps(claim_details))
 
     return jsonify({"message": "Ephemeral file stored for this claim."}), 200
 
@@ -337,18 +344,21 @@ def search():
     data = request.get_json()
     claim_id = data.get("claimID")
     query = data.get("query")
+    user_id = data.get("userID")
 
-    if not claim_id or not query:
-        return jsonify({"error": "claimID and query required"}), 400
+    if not claim_id or not query or not user_id:
+        return jsonify({"error": "claimID, query, and userID required"}), 400
 
-    if claim_id not in user_context:
+    if not redis_client.exists(f"claim:{claim_id}"):
         return jsonify({"error": "Invalid claimID. Start a conversation first."}), 400
 
-    conversation = user_context[claim_id]["conversation"]
-    claim_details = user_context[claim_id]["claim_details"]
-    user_id = user_context[claim_id]["user_id"]
+    stored_user_id = redis_client.hget(f"claim:{claim_id}", "user_id")
+    if stored_user_id != user_id:
+        return jsonify({"error": "Unauthorized: claimID does not belong to this user"}), 403
 
-    # Provide current claim details as context
+    conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
+    claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
+
     details_summary = (
         f"Current claim details: Date: {claim_details['date']}, "
         f"Location: {claim_details['location']}, "
@@ -357,7 +367,6 @@ def search():
     conversation.append({"role": "system", "content": details_summary})
     conversation.append({"role": "user", "content": query})
 
-    # Retrieve relevant knowledge from permanent library
     knowledge = retrieve_relevant_knowledge(user_id, query)
     if knowledge:
         conversation.append({
@@ -365,18 +374,17 @@ def search():
             "content": f"Relevant knowledge from your permanent documents:\n{knowledge}"
         })
 
-    # Get xAI's response
     answer = xai_chat_client.chat(conversation)
 
-    # Update claim details based on user response (basic parsing)
-    if any(word in query.lower() for word in ["datum", "date", "när", "when"]):
+    if "datum" in query.lower() or "date" in query.lower() or "när" in query.lower() or "when" in query.lower():
         claim_details["date"] = query
-    elif any(word in query.lower() for word in ["var", "where"]):
+    elif "var" in query.lower() or "where" in query.lower():
         claim_details["location"] = query
-    elif any(word in query.lower() for word in ["beskriv", "describe", "vad", "what"]):
+    elif "beskriv" in query.lower() or "describe" in query.lower() or "vad" in query.lower() or "what" in query.lower():
         claim_details["description"] = query
 
-    conversation.append({"role": "assistant", "content": answer})
+    redis_client.hset(f"claim:{claim_id}", "conversation", json.dumps(conversation))
+    redis_client.hset(f"claim:{claim_id}", "claim_details", json.dumps(claim_details))
     logger.info(f"Updated claim details for claimID {claim_id}: {claim_details}")
 
     return jsonify({"answer": answer, "claimID": claim_id}), 200
@@ -385,11 +393,20 @@ def search():
 def finalize_claim():
     data = request.get_json()
     claim_id = data.get("claimID")
-    if not claim_id or claim_id not in user_context:
-        return jsonify({"error": "Invalid or missing claimID"}), 400
+    user_id = data.get("userID")
 
-    ephemeral_docs = user_context[claim_id]["claim_details"]["ephemeral_docs"]
-    attached_files = [doc["filename"] for doc in ephemeral_docs]
+    if not claim_id or not user_id:
+        return jsonify({"error": "claimID and userID required"}), 400
+
+    if not redis_client.exists(f"claim:{claim_id}"):
+        return jsonify({"error": "Invalid claimID"}), 400
+
+    stored_user_id = redis_client.hget(f"claim:{claim_id}", "user_id")
+    if stored_user_id != user_id:
+        return jsonify({"error": "Unauthorized: claimID does not belong to this user"}), 403
+
+    claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
+    attached_files = [doc["filename"] for doc in claim_details["ephemeral_docs"]]
     message = (
         "Claim finalized. The following ephemeral documents have been attached:\n"
         f"{', '.join(attached_files)}\n\n"
