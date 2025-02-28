@@ -1,0 +1,2 @@
+https://www.dokie.se/userclaimidtest/ - sida för att hämta historiska chattar baserat på ett ClaimID. Vi måste ha möjlighet att skapa upp induvudell URL för varje claim. 
+
