@@ -1,0 +1,4 @@
+uploads/
+conversation_uploads/
+__pycache__/
+*.pyc
