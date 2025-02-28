@@ -6,7 +6,7 @@ import textwrap
 import json
 import uuid
 import redis
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory, redirect, url_for
 from docx import Document
 from PIL import Image, ImageEnhance
 import pytesseract
@@ -251,7 +251,6 @@ def start_conversation():
         "with a natural, empathetic, and context-aware conversation flow."
     )
 
-    # Store in Redis
     redis_client.hset(f"claim:{claim_id}", mapping={
         "user_id": user_id,
         "conversation": json.dumps([{"role": "system", "content": system_prompt}]),
@@ -260,7 +259,7 @@ def start_conversation():
     redis_client.sadd(f"user:{user_id}:claims", claim_id)
     
     logger.info(f"Started new conversation with claimID: {claim_id} for userID: {user_id}")
-    return jsonify({"message": "Conversation started.", "claimID": claim_id}), 200
+    return redirect(url_for('test', claimID=claim_id, userID=user_id))
 
 @app.route("/get_user_claims", methods=["POST"])
 def get_user_claims():
@@ -271,6 +270,28 @@ def get_user_claims():
 
     claim_ids = redis_client.smembers(f"user:{user_id}:claims") or []
     return jsonify({"claimIDs": list(claim_ids)}), 200
+
+@app.route("/userclaimidtest")
+def user_claimid_test():
+    return send_from_directory('static', 'userclaimidtest.html')
+
+@app.route("/test", methods=["GET"])
+def test():
+    claim_id = request.args.get("claimID")
+    user_id = request.args.get("userID")
+
+    if not claim_id or not user_id:
+        return "claimID and userID required in URL (e.g., /test?claimID=abc123&userID=test123)", 400
+
+    if not redis_client.exists(f"claim:{claim_id}"):
+        return "Invalid claimID", 400
+
+    stored_user_id = redis_client.hget(f"claim:{claim_id}", "user_id")
+    if stored_user_id != user_id:
+        return "Unauthorized: claimID does not belong to this user", 403
+
+    # Placeholder for your existing chat UI
+    return "Chat UI placeholder. Use claimID: {} and userID: {} in your frontend.".format(claim_id, user_id)
 
 @app.route("/upload_library", methods=["POST"])
 def upload_library():
