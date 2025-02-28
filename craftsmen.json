@@ -1,0 +1,26 @@
+[
+    {
+        "id": 1,
+        "name": "John’s Roofing",
+        "specialty": "roofing",
+        "location": "Goteburg",
+        "contact": "john@roofing.com",
+        "rating": 4.5
+    },
+    {
+        "id": 2,
+        "name": "PlumbRight",
+        "specialty": "plumbing",
+        "location": "molndal",
+        "contact": "info@plumbright.com",
+        "rating": 4.8
+    },
+    {
+        "id": 3,
+        "name": "FixIt Construction",
+        "specialty": "general",
+        "location": "Stockholm",
+        "contact": "fixit@construction.com",
+        "rating": 4.2
+    }
+]
