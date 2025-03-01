@@ -147,7 +147,8 @@ def generate_embeddings(text: str):
 def chunk_text(text: str, chunk_size: int = 1500) -> list:
     return textwrap.wrap(text, width=chunk_size)
 
-def store_embeddings(user_id: str, text: str):
+# Updated to accept an optional category parameter.
+def store_embeddings(user_id: str, text: str, category: str = None):
     if not text.strip():
         return
     chunks = chunk_text(text)
@@ -159,20 +160,23 @@ def store_embeddings(user_id: str, text: str):
             vectors.append({
                 "id": vector_id,
                 "values": embedding,
-                "metadata": {"user_id": user_id, "text": chunk}
+                "metadata": {"user_id": user_id, "text": chunk, "category": category}
             })
     if vectors:
         pinecone_index.upsert(vectors=vectors, namespace=user_id)
 
-def retrieve_relevant_knowledge(user_id: str, query: str, top_k: int = 3) -> str:
+# Updated to use a filter if a category is provided.
+def retrieve_relevant_knowledge(user_id: str, query: str, top_k: int = 3, category: str = None) -> str:
     embedding = generate_embeddings(query)
     if not embedding:
         return ""
+    filter = {"category": category} if category else None
     result = pinecone_index.query(
         vector=embedding,
         top_k=top_k,
         include_metadata=True,
-        namespace=user_id
+        namespace=user_id,
+        filter=filter
     )
     if not result.get("matches"):
         return ""
@@ -233,6 +237,7 @@ def generate_detailed_summary(claim_id: str, conversation: list, claim_details: 
     summary_lines.append(f"  Date & Time of Incident: {claim_details.get('date_time')}")
     summary_lines.append(f"  Location: {claim_details.get('location')}")
     summary_lines.append(f"  Incident Description: {claim_details.get('incident_description')}")
+    summary_lines.append(f"  Policy Category: {claim_details.get('category')}")
     summary_lines.append("")
     
     ephemeral_docs = claim_details.get("ephemeral_docs", [])
@@ -281,6 +286,27 @@ def is_negative_response(query: str) -> bool:
     negative_responses = {"no", "nope", "nothing", "none", "that's all", "no thanks", "no thank you"}
     return query.strip().lower() in negative_responses
 
+# NEW HELPER: Update missing fields from the document library (via Pinecone) using the claim's category.
+def update_claim_details_from_documents(user_id: str, claim_details: dict) -> dict:
+    category = claim_details.get("category")
+    field_queries = {
+        "full_name": "full name",
+        "policy_number": "policy number",
+        "phone": "phone number",
+        "email": "email address",
+        "claim_type": "type of claim",
+        "date_time": "date and time of incident",
+        "location": "location of incident",
+        "incident_description": "brief description of incident"
+    }
+    for field, query in field_queries.items():
+        if not claim_details.get(field):
+            result = retrieve_relevant_knowledge(user_id, query, category=category)
+            if result:
+                claim_details[field] = result.splitlines()[0].strip()
+                logger.info(f"Updated field '{field}' from documents: {claim_details[field]}")
+    return claim_details
+
 # ==============================
 # FLASK ROUTES
 # ==============================
@@ -297,7 +323,7 @@ def start_conversation():
 
     claim_id = str(uuid.uuid4())
     
-    # English system prompt instructing Dokie to confirm already known data from the document library.
+    # English system prompt instructing Dokie to confirm already known data.
     system_prompt = (
         "You are Dokie, a highly empathetic and logical AI assistant who helps policyholders with their insurance claims. "
         "Your task is to guide the customer through the entire process and ensure they receive proper compensation. "
@@ -319,6 +345,7 @@ def start_conversation():
         "date_time": None,
         "location": None,
         "incident_description": None,
+        "category": None,  # New field to indicate the insurance policy category.
         "ephemeral_docs": [],
         "summary_sent": False
     }
@@ -346,12 +373,16 @@ def get_user_claims():
 def user_claimid_test():
     return send_from_directory('static', 'userclaimidtest.html')
 
+# ------------------
+# Updated upload endpoints now accept a "category" field.
+# ------------------
 @app.route("/upload_library", methods=["POST"])
 def upload_library():
     if "file" not in request.files or "userID" not in request.form:
         return jsonify({"error": "file and userID required"}), 400
     file_obj = request.files["file"]
     user_id = request.form["userID"]
+    category = request.form.get("category")  # New: category for this document
     file_path = os.path.join(UPLOAD_FOLDER, file_obj.filename)
     file_obj.save(file_path)
     ext = os.path.splitext(file_obj.filename)[1].lower()
@@ -367,7 +398,7 @@ def upload_library():
     os.remove(file_path)
     if not text or not text.strip():
         return jsonify({"error": "Could not extract text"}), 400
-    store_embeddings(user_id, text)
+    store_embeddings(user_id, text, category=category)
     return jsonify({"message": "Document embedded in your permanent library."})
 
 @app.route("/upload_ephemeral", methods=["POST"])
@@ -377,6 +408,7 @@ def upload_ephemeral():
     file_obj = request.files["file"]
     claim_id = request.form["claimID"]
     user_id = request.form["userID"]
+    category = request.form.get("category")  # Optionally include category
     if not redis_client.exists(f"claim:{claim_id}"):
         return jsonify({"error": "Invalid claimID. Start a conversation first."}), 400
     stored_user_id = redis_client.hget(f"claim:{claim_id}", "user_id")
@@ -396,7 +428,8 @@ def upload_ephemeral():
     claim_details["ephemeral_docs"].append({
         "filename": file_obj.filename,
         "file_path": ephemeral_path,
-        "extracted_text": extracted_text or ""
+        "extracted_text": extracted_text or "",
+        "category": category  # Save category for this document if provided
     })
     redis_client.hset(f"claim:{claim_id}", "claim_details", json.dumps(claim_details))
     return jsonify({"message": "Ephemeral file stored for this claim."})
@@ -420,17 +453,35 @@ def search():
     conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
     claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
     
+    # Update claim details from document library using the specified category.
+    claim_details = update_claim_details_from_documents(user_id, claim_details)
+    
+    # Check if a category is already set; if not, try to infer from the query.
+    if not claim_details.get("category"):
+        if "home" in query.lower():
+            claim_details["category"] = "home"
+            answer = "I detected that you might be referring to your home insurance. Is that correct?"
+        elif "car" in query.lower() or "vehicle" in query.lower():
+            claim_details["category"] = "vehicle"
+            answer = "I detected that you might be referring to your vehicle insurance. Is that correct?"
+        else:
+            answer = None
+    else:
+        answer = None
+
     # Append user's query to conversation
     conversation.append({"role": "user", "content": query})
 
-    # If the query relates to the user's full name, confirm the known data.
+    # If the query relates to the full name, confirm the known data.
     if "name" in query.lower() or "full name" in query.lower():
         if claim_details.get("full_name"):
             answer = f"I see we already have your full name as {claim_details['full_name']}. Is that correct?"
         else:
             answer = "Could you please provide your full name?"
-    else:
-        knowledge = retrieve_relevant_knowledge(user_id, query)
+    
+    # If answer hasn't been set by the above category detection or field confirmation, generate a response.
+    if not answer:
+        knowledge = retrieve_relevant_knowledge(user_id, query, category=claim_details.get("category"))
         if knowledge:
             conversation.append({"role": "system", "content": f"Relevant knowledge:\n{knowledge}"})
         answer = xai_chat_client.chat(conversation)
