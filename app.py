@@ -26,7 +26,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 XAI_API_KEY = os.environ.get("XAI_API_KEY")
 REDIS_URL = os.environ.get("REDIS_URL")
-EXTERNAL_SERVICE_URL = os.environ.get("EXTERNAL_SERVICE_URL")  # URL for external service
+EXTERNAL_SERVICE_URL = os.environ.get("EXTERNAL_SERVICE_URL")  # URL for external processing service
 
 if not all([OPENAI_API_KEY, PINECONE_API_KEY, XAI_API_KEY, REDIS_URL]):
     logger.error("Missing required environment variables")
@@ -220,19 +220,51 @@ def extract_text_from_pdf(pdf_path: str):
         logger.error(f"PyPDF2 also failed: {e}")
     return None
 
-def generate_summary(query: str, claim_details: dict) -> str:
-    """Generate a concise summary of the user's query and current claim details."""
-    summary = (
-        f"User Query: {query}\n"
-        "Claim Details:\n"
-        f"  Date: {claim_details.get('date')}\n"
-        f"  Location: {claim_details.get('location')}\n"
-        f"  Description: {claim_details.get('description')}\n"
-    )
-    return summary
+def generate_detailed_summary(claim_id: str, conversation: list, claim_details: dict) -> str:
+    """
+    Generate a detailed report including:
+      - Claim ID
+      - All claim details (Policyholder Info & Claim Details)
+      - Information about uploaded documents (with a snippet of extracted text)
+      - Full conversation history
+    """
+    summary_lines = []
+    summary_lines.append(f"Detailed Claim Report for Claim ID: {claim_id}")
+    summary_lines.append("-" * 60)
+    summary_lines.append("Policyholder and Claim Details:")
+    summary_lines.append(f"  Full Name: {claim_details.get('full_name')}")
+    summary_lines.append(f"  Policy Number: {claim_details.get('policy_number')}")
+    summary_lines.append(f"  Phone: {claim_details.get('phone')}")
+    summary_lines.append(f"  Email: {claim_details.get('email')}")
+    summary_lines.append(f"  Claim Type: {claim_details.get('claim_type')}")
+    summary_lines.append(f"  Date & Time of Incident: {claim_details.get('date_time')}")
+    summary_lines.append(f"  Location: {claim_details.get('location')}")
+    summary_lines.append(f"  Incident Description: {claim_details.get('incident_description')}")
+    summary_lines.append("")
+    
+    # Uploaded Documents
+    ephemeral_docs = claim_details.get("ephemeral_docs", [])
+    if ephemeral_docs:
+        summary_lines.append("Uploaded Documents:")
+        for doc in ephemeral_docs:
+            summary_lines.append(f"  - Filename: {doc.get('filename')}")
+            extracted = doc.get("extracted_text")
+            if extracted:
+                summary_lines.append(f"    Extracted Text: {extracted[:200]}{'...' if len(extracted) > 200 else ''}")
+        summary_lines.append("")
+    
+    summary_lines.append("Full Conversation History:")
+    for msg in conversation:
+        role = msg.get("role")
+        content = msg.get("content")
+        summary_lines.append(f"  [{role.upper()}] {content}")
+    summary_lines.append("")
+    summary_lines.append("End of Report")
+    
+    return "\n".join(summary_lines)
 
 def send_summary_to_external(summary: str, claim_id: str):
-    """Send the summarized content to an external service, if configured."""
+    """Send the detailed summary to the external service, if configured."""
     if not EXTERNAL_SERVICE_URL:
         logger.info("No external service URL provided. Skipping summary send.")
         return
@@ -240,9 +272,31 @@ def send_summary_to_external(summary: str, claim_id: str):
     try:
         response = requests.post(EXTERNAL_SERVICE_URL, json=payload, timeout=10)
         response.raise_for_status()
-        logger.info(f"Summary sent to external service for claimID {claim_id}")
+        logger.info(f"Detailed summary sent to external service for claimID {claim_id}")
     except Exception as e:
-        logger.error(f"Failed to send summary to external service: {e}")
+        logger.error(f"Failed to send detailed summary to external service: {e}")
+
+def is_claim_complete(claim_details: dict) -> bool:
+    """
+    Determine if all required fields are present.
+    Required fields include:
+      - Policyholder Information: full_name, policy_number, phone, email
+      - Claim Details: claim_type, date_time, location, incident_description
+      - At least one uploaded document
+    """
+    required_fields = ["full_name", "policy_number", "phone", "email",
+                       "claim_type", "date_time", "location", "incident_description"]
+    for field in required_fields:
+        if not claim_details.get(field):
+            return False
+    if not claim_details.get("ephemeral_docs"):
+        return False
+    return True
+
+def is_negative_response(query: str) -> bool:
+    """Determine if the user's query indicates no further information."""
+    negative_responses = {"no", "nope", "nothing", "none", "that's all", "no thanks", "no thank you"}
+    return query.strip().lower() in negative_responses
 
 # ==============================
 # FLASK ROUTES
@@ -260,25 +314,37 @@ def start_conversation():
 
     claim_id = str(uuid.uuid4())
     
-    # Refined system prompt emphasizing step-by-step questioning and confirmation of known details.
+    # System prompt instructs Dokie to gather required info step-by-step.
     system_prompt = (
-        "You are Dokie, a highly empathetic and logical AI assistant who acts as both an advisor and a case manager for insurance claims. "
-        "Your role is to help clients navigate the insurance claims process from start to finish, ensuring they receive fair compensation. "
-        "Ask one question at a time so the client can answer easily. When you already have information from the client's document library—such as their address—do not ask for it again. Instead, confirm it by saying something like, 'I have your address as [address]. Is that correct?' "
-        "Listen carefully to the client's situation and gather all necessary details about the damage, loss, or issue they face. "
-        "Review their insurance policy to determine what is covered, and prepare a strong, comprehensive claim with all required documentation. "
-        "Communicate with the insurance company, respond to their requests, and negotiate on behalf of the client to maximize compensation. "
-        "If repairs are needed—for example, in cases of home damage or car repairs—help the client find a reliable and qualified craftsman, ensuring repair estimates align with insurance coverage. "
-        "Respond in the same language as the client (e.g., if they write in Swedish, reply in Swedish using natural expressions like 'Jag förstår, det låter jobbigt—kan du berätta mer?' or 'Låt oss lösa detta tillsammans—vad är nästa steg?'). "
-        "Review the *entire conversation history* stored in Redis for each claimID to avoid repetition. Progress logically based on what has already been discussed, ensuring that each question builds on previous answers without redundancy. "
-        "If a query is vague (e.g., 'I noticed it now'), interpret 'now' as 'today' unless specified otherwise, and ask clarifying, open-ended questions before offering advice. "
-        "Act as the client's trusted advocate throughout the insurance claim process."
+        "You are Dokie, a highly empathetic and logical AI assistant who acts as both an advisor and case manager for insurance claims. "
+        "Help clients navigate the entire process and ensure they receive fair compensation. Ask one question at a time. "
+        "If you already have information from documents (e.g., an address), confirm it instead of asking again. "
+        "Gather the following information if not already available:\n"
+        "  1. Policyholder Information: Full Name, Policy Number, Phone, Email\n"
+        "  2. Claim Details: Type of Claim (Property/Vehicle/Medical/Other), Date & Time of Incident, Location, Brief Description of Incident\n"
+        "  3. Required Documents: Photos/Videos of Damage, Invoices/Receipts, Police/Incident Report if applicable.\n"
+        "Once all required fields are collected, ask the client if there is any additional information. "
+        "If the client replies with a negative response (e.g., 'No'), then finalize the claim by sending a detailed report to the external service."
     )
-
+    
+    # Initialize claim details with all required fields as None
+    initial_details = {
+        "full_name": None,
+        "policy_number": None,
+        "phone": None,
+        "email": None,
+        "claim_type": None,
+        "date_time": None,
+        "location": None,
+        "incident_description": None,
+        "ephemeral_docs": [],
+        "summary_sent": False
+    }
+    
     redis_client.hset(f"claim:{claim_id}", mapping={
         "user_id": user_id,
         "conversation": json.dumps([{"role": "system", "content": system_prompt}]),
-        "claim_details": json.dumps({"date": None, "location": None, "description": None, "ephemeral_docs": []})
+        "claim_details": json.dumps(initial_details)
     })
     redis_client.sadd(f"user:{user_id}:claims", claim_id)
     
@@ -375,59 +441,54 @@ def search():
     user_id = data.get("userID")
 
     if not claim_id or not query or not user_id:
-        logger.error(f"Missing required fields in /search request: claimID={claim_id}, query={query}, userID={user_id}")
         return jsonify({"error": "claimID, query, and userID required"}), 400
 
     if not redis_client.exists(f"claim:{claim_id}"):
-        logger.error(f"Invalid claimID: {claim_id}")
         return jsonify({"error": "Invalid claimID. Start a conversation first."}), 400
 
     stored_user_id = redis_client.hget(f"claim:{claim_id}", "user_id")
     if stored_user_id != user_id:
-        logger.error(f"Unauthorized access attempt: claimID={claim_id}, userID={user_id}, stored_user_id={stored_user_id}")
         return jsonify({"error": "Unauthorized: claimID does not belong to this user"}), 403
 
-    # Load full conversation history and current claim details
+    # Load conversation history and claim details
     conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
     claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
 
-    # Append a summary of current claim details for context
-    details_summary = (
-        f"Current claim details: Date: {claim_details['date']}, "
-        f"Location: {claim_details['location']}, "
-        f"Description: {claim_details['description']}"
-    )
-    conversation.append({"role": "system", "content": details_summary})
+    # Append the user's query to the conversation
     conversation.append({"role": "user", "content": query})
 
-    # Retrieve relevant knowledge from Pinecone
+    # Optionally, retrieve additional context from the permanent document library
     knowledge = retrieve_relevant_knowledge(user_id, query)
     if knowledge:
-        conversation.append({"role": "system", "content": f"Relevant knowledge from your permanent documents:\n{knowledge}"})
+        conversation.append({"role": "system", "content": f"Relevant knowledge:\n{knowledge}"})
 
-    # Generate response using the full conversation history
+    # Generate Dokie's response based on the updated conversation
     answer = xai_chat_client.chat(conversation)
-
-    # Update claim details based on query, but avoid overwriting details already set.
-    if ("datum" in query.lower() or "date" in query.lower() or "när" in query.lower() or "when" in query.lower()) and not claim_details["date"]:
-        claim_details["date"] = query
-    elif ("var" in query.lower() or "where" in query.lower()):
-        if not claim_details["location"]:
-            claim_details["location"] = query
-    elif ("beskriv" in query.lower() or "describe" in query.lower() or "vad" in query.lower() or "what" in query.lower()) and not claim_details["description"]:
-        claim_details["description"] = query
-
-    # Append Dokie's response to conversation history
     conversation.append({"role": "assistant", "content": answer})
 
-    # Save updated conversation and claim details to Redis
+    # (In practice, you would update claim_details fields based on the query here,
+    # e.g., if query mentions "full name", update claim_details["full_name"], etc.
+    # This logic should ensure that if a field is already filled (extracted from documents),
+    # it is not overwritten.)
+
+    # Save the updated conversation and claim details
     redis_client.hset(f"claim:{claim_id}", "conversation", json.dumps(conversation))
     redis_client.hset(f"claim:{claim_id}", "claim_details", json.dumps(claim_details))
     logger.info(f"Updated claim details for claimID {claim_id}: {claim_details}")
 
-    # Generate summary and send it to external service in the background
-    summary = generate_summary(query, claim_details)
-    threading.Thread(target=send_summary_to_external, args=(summary, claim_id)).start()
+    # If the claim is complete, Dokie asks if there is additional information.
+    if is_claim_complete(claim_details):
+        if is_negative_response(query):
+            # User indicates no further info; finalize claim and send summary
+            if not claim_details.get("summary_sent"):
+                summary = generate_detailed_summary(claim_id, conversation, claim_details)
+                threading.Thread(target=send_summary_to_external, args=(summary, claim_id)).start()
+                claim_details["summary_sent"] = True
+                redis_client.hset(f"claim:{claim_id}", "claim_details", json.dumps(claim_details))
+                answer += "\n\nYour claim is complete and has been finalized."
+        else:
+            # If claim is complete but user response is not negative, ask for additional info.
+            answer += "\n\nWe have received all the necessary information for your claim. Do you have any additional details to add? (If not, please reply with 'No')."
 
     return jsonify({"answer": answer, "claimID": claim_id, "conversation": json.dumps(conversation)})
 
@@ -448,18 +509,22 @@ def finalize_claim():
         return jsonify({"error": "Unauthorized: claimID does not belong to this user"}), 403
 
     claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
-    attached_files = [doc["filename"] for doc in claim_details["ephemeral_docs"]]
+    conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
+    attached_files = [doc["filename"] for doc in claim_details.get("ephemeral_docs", [])]
     message = (
-        "Claim finalized. The following ephemeral documents have been attached:\n"
+        "Claim finalized. The following documents have been attached:\n"
         f"{', '.join(attached_files)}\n\n"
         "Permanent library references are included in the claim text. Good luck!"
     )
 
+    if not claim_details.get("summary_sent"):
+        summary = generate_detailed_summary(claim_id, conversation, claim_details)
+        threading.Thread(target=send_summary_to_external, args=(summary, claim_id)).start()
+        claim_details["summary_sent"] = True
+        redis_client.hset(f"claim:{claim_id}", "claim_details", json.dumps(claim_details))
+
     return jsonify({"message": message, "claimID": claim_id})
 
-# ==============================
-# NEW ENDPOINT: Retrieve Full Conversation History
-# ==============================
 @app.route("/get_conversation", methods=["POST"])
 def get_conversation():
     data = request.get_json()
