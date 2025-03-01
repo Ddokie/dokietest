@@ -225,18 +225,17 @@ def extract_text_from_pdf(pdf_path: str):
 # ------------------------------
 def update_claim_details_from_query(query: str, claim_details: dict) -> dict:
     lower_query = query.lower()
-    # Heuristic for date: if user mentions "yesterday", "today", etc.
+    # Update date if user mentions time hints
     if any(keyword in lower_query for keyword in ["yesterday", "today", "last night", "this morning"]):
-        # For demonstration, we simply store the query text.
-        claim_details["date"] = query
-    # Heuristic for location: look for keywords common in addresses
+        claim_details["date"] = query  # Could be enhanced with actual date parsing
+    # Update location if keywords are detected
     if not claim_details.get("location"):
         if any(keyword in lower_query for keyword in [" at ", " in ", "home", "office", "street"]):
             claim_details["location"] = query
-    # Heuristic for description: if accident/injury keywords appear
+    # Update description with accident/injury details
     if any(keyword in lower_query for keyword in ["accident", "fell", "injured", "broke", "fracture", "damage"]):
         claim_details["description"] = query
-    # Infer policy category if not set already
+    # Infer policy category if not already set
     if not claim_details.get("category"):
         if "home" in lower_query:
             claim_details["category"] = "home"
@@ -250,12 +249,31 @@ def update_claim_details_from_query(query: str, claim_details: dict) -> dict:
 # New: Update claim details from document knowledge (stub)
 # ------------------------------
 def update_claim_details_from_documents(user_id: str, claim_details: dict, category: str = None) -> dict:
-    # For example, if the description is missing, try to retrieve relevant text.
+    # Example: If description is missing, try to retrieve relevant text from documents.
     if not claim_details.get("description"):
         doc_knowledge = retrieve_relevant_knowledge(user_id, "claim description")
         if doc_knowledge:
             claim_details["description"] = doc_knowledge
     return claim_details
+
+# ------------------------------
+# New: Recommend craftsmen if repair assistance is needed
+# ------------------------------
+def get_craftsman_recommendations(category: str = None, limit: int = 3) -> str:
+    # For simplicity, if a category is provided, filter the craftsmen list accordingly.
+    # Otherwise, just return the first few recommendations.
+    recommendations = []
+    if category:
+        for craftsman in CRAFTSMEN:
+            if category.lower() in craftsman.get("specialty", "").lower():
+                recommendations.append(craftsman)
+    if not recommendations:
+        recommendations = CRAFTSMEN
+    recommendations = recommendations[:limit]
+    rec_lines = []
+    for c in recommendations:
+        rec_lines.append(f"- {c.get('name')} (Rating: {c.get('rating')}/5, Contact: {c.get('contact')})")
+    return "\n".join(rec_lines)
 
 # ==============================
 # FLASK ROUTES
@@ -273,19 +291,15 @@ def start_conversation():
 
     claim_id = str(uuid.uuid4())
     
+    # Updated system prompt reflecting Dokie's role as advisor, case manager, and trusted advocate
     system_prompt = (
-        "You are Dokie, an empathetic and highly logical AI assistant helping users with insurance claims. "
-        "Respond in the same language as the user's query, using natural, conversational, and empathetic phrasing to make the user feel understood and guided. "
-        "You have a permanent document library in Pinecone for coverage details and ephemeral memory for claim evidence (photos, etc.). "
-        "Your primary goal is to help users claim compensation by analyzing their document library and providing the best approach for a successful claim. "
-        "Prioritize the user's immediate query or concern, always responding directly and logically. "
-        "If the query is vague or ambiguous (e.g., 'I noticed it now'), interpret 'now' as 'today' unless the user specifies otherwise, and ask clarifying, "
-        "open-ended questions (e.g., 'What did you notice today? Can you describe the issue in more detail?') before offering advice or gathering details. "
-        "Avoid making assumptions unless the user explicitly states the problem. "
-        "Use varied, natural phrasing to confirm details already provided (e.g., 'I see your details as... is that correct?') and avoid repetitive prompts. "
-        "For severe issues, suggest relevant craftsman recommendations immediately. "
-        "Track the conversation history and claim details carefully. "
-        "Your goal is to maximize the user's claim success with a smart, intuitive, and human-like conversation flow."
+        "You are Dokie, an empathetic and highly logical AI assistant who serves as both an advisor and a case manager. "
+        "Your role is to help clients navigate the insurance claims process from start to finish, ensuring they receive fair compensation. "
+        "You gather all necessary details about the claim, review the client’s policy for coverage, prepare and submit a strong claim with all documentation, "
+        "communicate with the insurance company on the client’s behalf, and negotiate to maximize their compensation. "
+        "If repairs are needed, you also connect clients with reliable and qualified craftsmen whose repair estimates align with the insurance coverage. "
+        "Always confirm previously known details in a natural and conversational manner to avoid redundancy. "
+        "Your goal is to simplify the insurance claim process, acting as the client's trusted advocate throughout."
     )
 
     initial_claim_details = {"date": None, "location": None, "description": None, "category": None, "ephemeral_docs": []}
@@ -405,7 +419,7 @@ def search():
     conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
     claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
 
-    # Append current claim details to the conversation for context
+    # Append current claim details for context
     details_summary = (
         f"Current claim details: Date: {claim_details.get('date')}, "
         f"Location: {claim_details.get('location')}, "
@@ -423,12 +437,21 @@ def search():
             "content": f"Relevant knowledge from your permanent documents:\n{knowledge}"
         })
 
-    # Update claim details using our heuristics and document-based knowledge
+    # Update claim details using heuristics and document-based knowledge
     claim_details = update_claim_details_from_query(query, claim_details)
     claim_details = update_claim_details_from_documents(user_id, claim_details, claim_details.get("category"))
 
     answer = xai_chat_client.chat(conversation)
     conversation.append({"role": "assistant", "content": answer})
+    
+    # If the conversation indicates repair assistance is needed, inject craftsmen recommendations.
+    lower_query = query.lower()
+    if any(keyword in lower_query for keyword in ["repair", "fix", "broken", "damage", "craftsman", "recommendation"]):
+        recs = get_craftsman_recommendations(claim_details.get("category"))
+        rec_message = "Based on the details of your claim, here are some recommended craftsmen to assist with repairs:\n" + recs
+        conversation.append({"role": "assistant", "content": rec_message})
+        # Optionally, update the claim details with the recommendation for record keeping.
+        claim_details["craftsman_recommendations"] = recs
 
     # Persist updated conversation and claim details in Redis
     redis_client.hset(f"claim:{claim_id}", "conversation", json.dumps(conversation))
@@ -457,7 +480,7 @@ def finalize_claim():
     conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
     claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
 
-    # Build a summary report that includes conversation history and claim details
+    # Build a detailed summary report that includes conversation history and claim details
     summary_report = {
         "claimID": claim_id,
         "userID": user_id,
@@ -465,7 +488,7 @@ def finalize_claim():
         "claim_details": claim_details
     }
 
-    # Send the summary report to the external service
+    # Send the summary report to the external service for further processing
     try:
         response = requests.post(EXTERNAL_SERVICE_URL, json=summary_report, timeout=30)
         response.raise_for_status()
@@ -475,8 +498,8 @@ def finalize_claim():
         return jsonify({"error": "Failed to send claim summary to external service."}), 500
 
     message = (
-        "Claim finalized and summary report sent to the external service. "
-        "The following ephemeral documents have been attached: " +
+        "Your claim has been finalized and a detailed summary report has been sent to the external service. "
+        "Attached ephemeral documents: " +
         ", ".join([doc["filename"] for doc in claim_details.get("ephemeral_docs", [])])
     )
 
