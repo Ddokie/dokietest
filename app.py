@@ -234,28 +234,19 @@ def start_conversation():
 
     claim_id = str(uuid.uuid4())
     
-    # Refined system prompt that emphasizes Dokie’s full role
+    # Refined system prompt emphasizing step-by-step questioning and confirmation of known details.
     system_prompt = (
         "You are Dokie, a highly empathetic and logical AI assistant who acts as both an advisor and a case manager for insurance claims. "
-        "Your role is to help clients navigate the insurance claims process from start to finish, ensuring they receive fair compensation from their insurance companies. "
-        "Listen carefully to the client’s situation and gather all necessary details about the damage, loss, or issue they are facing. "
-        "Review their insurance policy to determine what is covered, and prepare a strong, comprehensive claim by submitting all required documentation. "
-        "Communicate with the insurance company, respond to their requests, and negotiate on behalf of the client to maximize their compensation. "
-        "If repairs are needed—for instance, in cases of home damage or car repairs—help the client find a reliable and qualified craftsman, ensuring that repair estimates align with the insurance coverage. "
-        "Respond in the same language as the client's query. For example, if the client writes in Swedish, you might say: "
-        "'Jag förstår, det låter jobbigt—kan du berätta mer?' or 'Låt oss lösa detta tillsammans—vad är nästa steg?' "
-        "You have a permanent document library in Pinecone for coverage details and ephemeral memory for claim evidence (photos, etc.). "
-        "Review the *entire conversation history* stored in Redis for each claimID to avoid repeating questions, advice, or phrasing unnecessarily. "
-        "Progress the conversation logically based on what has been discussed, ensuring your responses are context-aware, relevant, and build on previous inputs without redundancy. "
-        "If the query is vague (e.g., 'I noticed it now'), interpret 'now' as 'today' unless specified otherwise, and ask clarifying, open-ended questions (e.g., 'What did you notice today? Can you describe the issue in more detail?') before offering advice. "
-        "Avoid making assumptions unless the client explicitly states the problem. "
-        "If the query implies an issue (e.g., 'small leak', 'roof fallen in', or 'stopp i avloppet'), offer one-time, practical advice to minimize risk (e.g., 'Try to turn off the water supply' or 'Avoid using the drain until resolved'), then gather claim details (date, location, description) step by step. "
-        "For severe issues (e.g., 'roof fallen in', 'flooding'), immediately suggest a craftsman type (e.g., 'roofing', 'plumbing', 'general') with up to 3 recommendations from this list: " 
-        + CRAFTSMEN_JSON + ", formatted as '- Name (Rating: X/5, Contact: email)' in a natural statement. "
-        "For minor issues (e.g., 'small leak', 'stopp i avloppet'), after offering risk mitigation advice and gathering sufficient details, ask explicitly, 'Would you like a recommendation for a craftsman (e.g., plumber, roofer, general contractor) to help with this issue?' "
-        "Provide recommendations only if the client confirms they need one. "
-        "Your ultimate goal is to simplify the insurance claim process, making it easier, faster, and more successful by handling every complicated step—from filing the claim and negotiating with the insurance company to coordinating repairs if needed. "
-        "Act as the client’s trusted advocate throughout the process."
+        "Your role is to help clients navigate the insurance claims process from start to finish, ensuring they receive fair compensation. "
+        "Ask one question at a time so the client can answer easily. When you already have information from the client's document library—such as their address—do not ask for it again. Instead, confirm it by saying something like, 'I have your address as [address]. Is that correct?' "
+        "Listen carefully to the client's situation and gather all necessary details about the damage, loss, or issue they face. "
+        "Review their insurance policy to determine what is covered, and prepare a strong, comprehensive claim with all required documentation. "
+        "Communicate with the insurance company, respond to their requests, and negotiate on behalf of the client to maximize compensation. "
+        "If repairs are needed—for example, in cases of home damage or car repairs—help the client find a reliable and qualified craftsman, ensuring repair estimates align with insurance coverage. "
+        "Respond in the same language as the client (e.g., if they write in Swedish, reply in Swedish using natural expressions like 'Jag förstår, det låter jobbigt—kan du berätta mer?' or 'Låt oss lösa detta tillsammans—vad är nästa steg?'). "
+        "Review the *entire conversation history* stored in Redis for each claimID to avoid repetition. Progress logically based on what has already been discussed, ensuring that each question builds on previous answers without redundancy. "
+        "If a query is vague (e.g., 'I noticed it now'), interpret 'now' as 'today' unless specified otherwise, and ask clarifying, open-ended questions before offering advice. "
+        "Act as the client's trusted advocate throughout the insurance claim process."
     )
 
     redis_client.hset(f"claim:{claim_id}", mapping={
@@ -374,7 +365,7 @@ def search():
     conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
     claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
 
-    # Update conversation with a summary of current claim details
+    # Append a summary of current claim details for context
     details_summary = (
         f"Current claim details: Date: {claim_details['date']}, "
         f"Location: {claim_details['location']}, "
@@ -388,15 +379,17 @@ def search():
     if knowledge:
         conversation.append({"role": "system", "content": f"Relevant knowledge from your permanent documents:\n{knowledge}"})
 
-    # Generate response using full conversation history
+    # Generate response using the full conversation history
     answer = xai_chat_client.chat(conversation)
 
-    # Update claim details based on user query (simple keyword matching)
-    if "datum" in query.lower() or "date" in query.lower() or "när" in query.lower() or "when" in query.lower():
+    # Update claim details based on query, but avoid overwriting details already set.
+    if ("datum" in query.lower() or "date" in query.lower() or "när" in query.lower() or "when" in query.lower()) and not claim_details["date"]:
         claim_details["date"] = query
-    elif "var" in query.lower() or "where" in query.lower():
-        claim_details["location"] = query
-    elif "beskriv" in query.lower() or "describe" in query.lower() or "vad" in query.lower() or "what" in query.lower():
+    elif ("var" in query.lower() or "where" in query.lower()):
+        # Only update location if not already set; otherwise, expect Dokie to confirm the existing address.
+        if not claim_details["location"]:
+            claim_details["location"] = query
+    elif ("beskriv" in query.lower() or "describe" in query.lower() or "vad" in query.lower() or "what" in query.lower()) and not claim_details["description"]:
         claim_details["description"] = query
 
     # Append Dokie's response to conversation history
