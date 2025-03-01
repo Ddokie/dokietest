@@ -241,14 +241,17 @@ def start_conversation():
         "For ephemeral claim evidence (photos, etc.), store them in ephemeral memory. "
         "Your primary goal is to help users claim compensation by analyzing their document library "
         "and providing the best approach for a successful claim. Prioritize responding to the user's immediate query or concern. "
-        "If the query implies a problem (e.g., 'small leak', 'roof fallen in'), first offer practical advice to minimize risk or damage, "
-        "then gather claim details (date, location, description) one question at a time if needed for the claim. "
-        "For severe issues (e.g., 'roof fallen in'), suggest a craftsman type (e.g., 'roofing', 'plumbing', 'general') immediately "
+        "If the query is vague or ambiguous (e.g., 'I noticed it now'), first ask clarifying questions (e.g., 'What did you notice? Can you describe the problem?') "
+        "before offering advice or gathering details, ensuring you don’t repeat generic advice unnecessarily. If the query implies a problem (e.g., 'small leak', 'roof fallen in'), "
+        "offer practical advice to minimize risk or damage once, then proceed logically with claim details (date, location, description) one question at a time, "
+        "building on the user’s responses without redundancy. For severe issues (e.g., 'roof fallen in', 'flooding'), suggest a craftsman type (e.g., 'roofing', 'plumbing', 'general') immediately "
         "with up to 3 recommendations from this list: " + CRAFTSMEN_JSON + ", formatted as '- Name (Rating: X/5, Contact: email)' "
-        "in the user's language, using a natural statement (not a question). For minor issues (e.g., 'small leak'), suggest craftsmen "
-        "only after offering risk mitigation advice and gathering sufficient details. Craftsman suggestions are secondary to claim assistance. "
-        "Adapt your response based on conversation history and claim details. Your ultimate goal: maximize the user's claim success "
-        "with a natural, empathetic, and context-aware conversation flow."
+        "in the user's language, using a natural statement (not a question). For minor issues (e.g., 'small leak'), after offering risk mitigation advice and gathering sufficient details, "
+        "ask explicitly, 'Do you need a craftsman recommendation (e.g., plumber, roofer, general contractor) to assist with this issue?' "
+        "Only provide recommendations if the user confirms they need one, using the list provided. Craftsman suggestions are secondary to claim assistance. "
+        "Use empathetic, clear, and logical language to ensure the user feels understood and guided. Avoid jumping to conclusions or making assumptions "
+        "unless explicitly stated by the user. Track the conversation history to avoid repeating advice or questions unnecessarily. "
+        "Your ultimate goal: maximize the user's claim success with a natural, context-aware, and step-by-step conversation flow."
     )
 
     redis_client.hset(f"claim:{claim_id}", mapping={
@@ -345,18 +348,22 @@ def upload_ephemeral():
 @app.route("/search", methods=["POST"])
 def search():
     data = request.get_json()
+    logger.info(f"Received /search request with data: {json.dumps(data)}")  # Debug log
     claim_id = data.get("claimID")
     query = data.get("query")
     user_id = data.get("userID")
 
     if not claim_id or not query or not user_id:
+        logger.error(f"Missing required fields in /search request: claimID={claim_id}, query={query}, userID={user_id}")
         return jsonify({"error": "claimID, query, and userID required"}), 400
 
     if not redis_client.exists(f"claim:{claim_id}"):
+        logger.error(f"Invalid claimID: {claim_id}")
         return jsonify({"error": "Invalid claimID. Start a conversation first."}), 400
 
     stored_user_id = redis_client.hget(f"claim:{claim_id}", "user_id")
     if stored_user_id != user_id:
+        logger.error(f"Unauthorized access attempt: claimID={claim_id}, userID={user_id}, stored_user_id={stored_user_id}")
         return jsonify({"error": "Unauthorized: claimID does not belong to this user"}), 403
 
     conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
@@ -390,7 +397,7 @@ def search():
     redis_client.hset(f"claim:{claim_id}", "claim_details", json.dumps(claim_details))
     logger.info(f"Updated claim details for claimID {claim_id}: {claim_details}")
 
-    return jsonify({"answer": answer, "claimID": claim_id}), 200
+    return jsonify({"answer": answer, "claimID": claim_id, "conversation": json.dumps(conversation)}), 200
 
 @app.route("/finalize_claim", methods=["POST"])
 def finalize_claim():
