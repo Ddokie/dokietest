@@ -235,25 +235,25 @@ def start_conversation():
     claim_id = str(uuid.uuid4())
     
     system_prompt = (
-        "You are Dokie, an empathetic and highly logical AI assistant helping users with insurance claims. "
+        "You are Dokie, a highly empathetic and logical AI assistant helping users with insurance claims or general inquiries. "
         "Respond in the same language as the user's query, using natural, conversational, and empathetic phrasing to make the user feel understood and guided. "
         "You have a permanent document library in Pinecone for coverage details and ephemeral memory for claim evidence (photos, etc.). "
         "Your primary goal is to help users claim compensation by analyzing their document library and providing the best approach for a successful claim. "
         "Prioritize the user's immediate query or concern, always responding directly and logically. "
+        "Review the *entire conversation history* stored in Redis for each claimID to avoid repeating questions, advice, or phrasing unnecessarily. "
+        "Progress the conversation logically based on what has already been discussed, ensuring responses are context-aware, relevant, and build on previous user inputs without redundancy. "
         "If the query is vague or ambiguous (e.g., 'I noticed it now'), interpret 'now' as 'today' unless the user specifies otherwise, and ask clarifying, "
         "open-ended questions (e.g., 'What did you notice today? Can you describe the issue in more detail?') before offering advice or gathering details. "
         "Avoid making assumptions unless the user explicitly states the problem (e.g., don’t assume a leak unless mentioned). "
-        "If the query implies a problem (e.g., 'small leak', 'roof fallen in'), offer practical, one-time advice to minimize risk or damage (e.g., 'Try to turn off the water supply'), "
-        "then proceed logically with claim details (date, location, description) one question at a time, building on the user’s responses without redundancy or repetitive phrases like "
-        "'För att kunna hjälpa dig på bästa sätt med din försäkringsclaim, behöver jag lite mer information.' Instead, use varied, natural phrases such as "
-        "'Let’s get the details to help with your claim,' or 'I’m here to assist—can you share more?' "
+        "If the query implies a problem (e.g., 'small leak', 'roof fallen in', or 'stopp i avloppet'), offer practical, one-time advice to minimize risk or damage (e.g., 'Try to turn off the water supply' or 'Avoid using the drain until resolved'), "
+        "then proceed logically with claim details (date, location, description) one question at a time, building on the user’s responses without redundancy or repetitive phrases. "
         "For severe issues (e.g., 'roof fallen in', 'flooding'), suggest a craftsman type (e.g., 'roofing', 'plumbing', 'general') immediately "
         "with up to 3 recommendations from this list: " + CRAFTSMEN_JSON + ", formatted as '- Name (Rating: X/5, Contact: email)' "
-        "in the user's language, using a natural statement (not a question). For minor issues (e.g., 'small leak'), after offering risk mitigation advice and gathering sufficient details "
+        "in the user's language, using a natural statement (not a question). For minor issues (e.g., 'small leak', 'stopp i avloppet'), after offering risk mitigation advice and gathering sufficient details "
         "(date, location, description), ask explicitly, 'Would you like a recommendation for a craftsman (e.g., plumber, roofer, general contractor) to help with this issue?' "
         "Provide recommendations only if the user confirms they need one, using the list provided. Craftsman suggestions are secondary to claim assistance. "
-        "Track the conversation history in Redis to avoid repeating advice, questions, or phrasing unnecessarily. Use logical, context-aware reasoning to ensure each response feels natural, "
-        "empathetic, and progresses the conversation smoothly. Your ultimate goal: maximize the user's claim success with a smart, intuitive, and human-like conversation flow."
+        "Use logical, context-aware reasoning to ensure each response feels natural, empathetic, and progresses the conversation smoothly, without repeating phrases or questions already covered. "
+        "Track claim details (date, location, description) in the conversation history and use them to guide questions and avoid redundancy. Your ultimate goal: maximize the user's claim success with a smart, intuitive, and human-like conversation flow."
     )
 
     redis_client.hset(f"claim:{claim_id}", mapping={
@@ -264,7 +264,7 @@ def start_conversation():
     redis_client.sadd(f"user:{user_id}:claims", claim_id)
     
     logger.info(f"Started new conversation with claimID: {claim_id} for userID: {user_id}")
-    return jsonify({"message": "Conversation started.", "claimID": claim_id}), 200
+    return jsonify({"message": "Conversation started.", "claimID": claim_id})
 
 @app.route("/get_user_claims", methods=["POST"])
 def get_user_claims():
@@ -274,7 +274,7 @@ def get_user_claims():
         return jsonify({"error": "userID required"}), 400
 
     claim_ids = redis_client.smembers(f"user:{user_id}:claims") or []
-    return jsonify({"claimIDs": list(claim_ids)}), 200
+    return jsonify({"claimIDs": list(claim_ids)})
 
 @app.route("/userclaimidtest")
 def user_claimid_test():
@@ -307,7 +307,7 @@ def upload_library():
         return jsonify({"error": "Could not extract text"}), 400
 
     store_embeddings(user_id, text)
-    return jsonify({"message": "Document embedded in your permanent library."}), 200
+    return jsonify({"message": "Document embedded in your permanent library."})
 
 @app.route("/upload_ephemeral", methods=["POST"])
 def upload_ephemeral():
@@ -345,7 +345,7 @@ def upload_ephemeral():
     })
     redis_client.hset(f"claim:{claim_id}", "claim_details", json.dumps(claim_details))
 
-    return jsonify({"message": "Ephemeral file stored for this claim."}), 200
+    return jsonify({"message": "Ephemeral file stored for this claim."})
 
 @app.route("/search", methods=["POST"])
 def search():
@@ -368,9 +368,11 @@ def search():
         logger.error(f"Unauthorized access attempt: claimID={claim_id}, userID={user_id}, stored_user_id={stored_user_id}")
         return jsonify({"error": "Unauthorized: claimID does not belong to this user"}), 403
 
+    # Load full conversation history
     conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
     claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
 
+    # Update conversation with user's query
     details_summary = (
         f"Current claim details: Date: {claim_details['date']}, "
         f"Location: {claim_details['location']}, "
@@ -379,15 +381,15 @@ def search():
     conversation.append({"role": "system", "content": details_summary})
     conversation.append({"role": "user", "content": query})
 
+    # Retrieve relevant knowledge from Pinecone
     knowledge = retrieve_relevant_knowledge(user_id, query)
     if knowledge:
-        conversation.append({
-            "role": "system",
-            "content": f"Relevant knowledge from your permanent documents:\n{knowledge}"
-        })
+        conversation.append({"role": "system", "content": f"Relevant knowledge from your permanent documents:\n{knowledge}"})
 
+    # Generate response using full conversation history
     answer = xai_chat_client.chat(conversation)
 
+    # Update claim details based on user response
     if "datum" in query.lower() or "date" in query.lower() or "när" in query.lower() or "when" in query.lower():
         claim_details["date"] = query
     elif "var" in query.lower() or "where" in query.lower():
@@ -395,11 +397,15 @@ def search():
     elif "beskriv" in query.lower() or "describe" in query.lower() or "vad" in query.lower() or "what" in query.lower():
         claim_details["description"] = query
 
+    # Append Dokie's response to conversation history
+    conversation.append({"role": "assistant", "content": answer})
+
+    # Save updated conversation and claim details to Redis
     redis_client.hset(f"claim:{claim_id}", "conversation", json.dumps(conversation))
     redis_client.hset(f"claim:{claim_id}", "claim_details", json.dumps(claim_details))
     logger.info(f"Updated claim details for claimID {claim_id}: {claim_details}")
 
-    return jsonify({"answer": answer, "claimID": claim_id, "conversation": json.dumps(conversation)}), 200
+    return jsonify({"answer": answer, "claimID": claim_id, "conversation": json.dumps(conversation)})
 
 @app.route("/finalize_claim", methods=["POST"])
 def finalize_claim():
@@ -425,7 +431,7 @@ def finalize_claim():
         "Permanent library references are included in the claim text. Good luck!"
     )
 
-    return jsonify({"message": message, "claimID": claim_id}), 200
+    return jsonify({"message": message, "claimID": claim_id})
 
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
