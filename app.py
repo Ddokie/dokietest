@@ -6,7 +6,7 @@ import textwrap
 import json
 import uuid
 import redis
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from docx import Document
 from PIL import Image, ImageEnhance
 import pytesseract
@@ -41,13 +41,6 @@ redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 app = Flask(__name__)
 CORS(app)
 
-UPLOAD_FOLDER = "uploads"
-EPHEMERAL_FOLDER = "ephemeral_uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(EPHEMERAL_FOLDER, exist_ok=True)
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["EPHEMERAL_FOLDER"] = EPHEMERAL_FOLDER
-
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -69,6 +62,42 @@ if INDEX_NAME not in pc.list_indexes().names():
         spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
 pinecone_index = pc.Index(INDEX_NAME)
+
+# ==============================
+# HELPER FUNCTIONS
+# ==============================
+def generate_embeddings(text: str):
+    """Generates an embedding vector using OpenAI API"""
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/embeddings",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={"input": text, "model": "text-embedding-ada-002"}
+        )
+        resp.raise_for_status()
+        return resp.json()["data"][0]["embedding"]
+    except Exception as e:
+        logger.error(f"Embedding generation failed: {e}")
+        return None
+
+def retrieve_relevant_knowledge(user_id: str, query: str, top_k: int = 3) -> str:
+    """Fetches the most relevant document information based on user query"""
+    embedding = generate_embeddings(query)
+    if not embedding:
+        return ""
+
+    result = pinecone_index.query(
+        vector=embedding,
+        top_k=top_k,
+        include_metadata=True,
+        namespace=user_id
+    )
+
+    if not result.get("matches"):
+        return ""
+
+    matches = [m["metadata"]["text"] for m in result["matches"]]
+    return "\n".join(matches)
 
 # ==============================
 # CHAT HISTORY API
@@ -126,8 +155,8 @@ def search():
         conversation.append({"role": "system", "content": f"Relevant knowledge from your permanent documents:\n{knowledge}"})
 
     # Generate AI response
-    answer = xai_chat_client.chat(conversation)
-
+    answer = "This is a placeholder response from the AI model."
+    
     # Append AI response
     conversation.append({"role": "assistant", "content": answer})
 
@@ -178,10 +207,6 @@ def finalize_claim():
 
     if not redis_client.exists(f"claim:{claim_id}"):
         return jsonify({"error": "Invalid claimID"}), 400
-
-    stored_user_id = redis_client.hget(f"claim:{claim_id}", "user_id")
-    if stored_user_id != user_id:
-        return jsonify({"error": "Unauthorized: claimID does not belong to this user"}), 403
 
     conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
 
