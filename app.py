@@ -6,6 +6,7 @@ import textwrap
 import json
 import uuid
 import redis
+import threading
 from flask import Flask, request, jsonify, send_from_directory
 from docx import Document
 from PIL import Image, ImageEnhance
@@ -25,6 +26,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 XAI_API_KEY = os.environ.get("XAI_API_KEY")
 REDIS_URL = os.environ.get("REDIS_URL")
+EXTERNAL_SERVICE_URL = os.environ.get("EXTERNAL_SERVICE_URL")  # URL for external service
 
 if not all([OPENAI_API_KEY, PINECONE_API_KEY, XAI_API_KEY, REDIS_URL]):
     logger.error("Missing required environment variables")
@@ -218,6 +220,30 @@ def extract_text_from_pdf(pdf_path: str):
         logger.error(f"PyPDF2 also failed: {e}")
     return None
 
+def generate_summary(query: str, claim_details: dict) -> str:
+    """Generate a concise summary of the user's query and current claim details."""
+    summary = (
+        f"User Query: {query}\n"
+        "Claim Details:\n"
+        f"  Date: {claim_details.get('date')}\n"
+        f"  Location: {claim_details.get('location')}\n"
+        f"  Description: {claim_details.get('description')}\n"
+    )
+    return summary
+
+def send_summary_to_external(summary: str, claim_id: str):
+    """Send the summarized content to an external service, if configured."""
+    if not EXTERNAL_SERVICE_URL:
+        logger.info("No external service URL provided. Skipping summary send.")
+        return
+    payload = {"claimID": claim_id, "summary": summary}
+    try:
+        response = requests.post(EXTERNAL_SERVICE_URL, json=payload, timeout=10)
+        response.raise_for_status()
+        logger.info(f"Summary sent to external service for claimID {claim_id}")
+    except Exception as e:
+        logger.error(f"Failed to send summary to external service: {e}")
+
 # ==============================
 # FLASK ROUTES
 # ==============================
@@ -361,7 +387,7 @@ def search():
         logger.error(f"Unauthorized access attempt: claimID={claim_id}, userID={user_id}, stored_user_id={stored_user_id}")
         return jsonify({"error": "Unauthorized: claimID does not belong to this user"}), 403
 
-    # Load full conversation history
+    # Load full conversation history and current claim details
     conversation = json.loads(redis_client.hget(f"claim:{claim_id}", "conversation"))
     claim_details = json.loads(redis_client.hget(f"claim:{claim_id}", "claim_details"))
 
@@ -386,7 +412,6 @@ def search():
     if ("datum" in query.lower() or "date" in query.lower() or "när" in query.lower() or "when" in query.lower()) and not claim_details["date"]:
         claim_details["date"] = query
     elif ("var" in query.lower() or "where" in query.lower()):
-        # Only update location if not already set; otherwise, expect Dokie to confirm the existing address.
         if not claim_details["location"]:
             claim_details["location"] = query
     elif ("beskriv" in query.lower() or "describe" in query.lower() or "vad" in query.lower() or "what" in query.lower()) and not claim_details["description"]:
@@ -399,6 +424,10 @@ def search():
     redis_client.hset(f"claim:{claim_id}", "conversation", json.dumps(conversation))
     redis_client.hset(f"claim:{claim_id}", "claim_details", json.dumps(claim_details))
     logger.info(f"Updated claim details for claimID {claim_id}: {claim_details}")
+
+    # Generate summary and send it to external service in the background
+    summary = generate_summary(query, claim_details)
+    threading.Thread(target=send_summary_to_external, args=(summary, claim_id)).start()
 
     return jsonify({"answer": answer, "claimID": claim_id, "conversation": json.dumps(conversation)})
 
